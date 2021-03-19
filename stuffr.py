@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 #
 # An attempt to translate the main functionality my main
 # R radio signal packages gursipr and stuffr to python.
@@ -161,8 +162,8 @@ def unix2date(x):
 def unix2iso8601(t):
     return(unix2date(t).strftime("%Y-%m-%dT%H:%M:%SZ"))
 
-def unix2iso8601_dirname(t):
-    return(unix2date(t).strftime("%Y-%m-%dT%H:00:00Z"))
+def unix2iso8601_dirname(t, ic):
+    return(unix2date(t).strftime(ic.ionogram_dirname))
 
 
 def sec2dirname(t):
@@ -173,7 +174,7 @@ def dirname2unix(dirn):
     return(date2unix(int(r.group(1)),int(r.group(2)),int(r.group(3)),int(r.group(4)),int(r.group(5)),int(r.group(6))))
 
 def unix2datestr(x):
-    return(unix2date(x).strftime('%Y-%m-%d %H:%M:%S'))
+    return(unix2date(x).strftime('%Y-%m-%d %H:%M:%S %Z'))
 
 def compr(x,fr=0.001):
     sh = x.shape
@@ -216,7 +217,7 @@ def comprz_dB(xx,fr=0.05):
     return(10.0*numpy.log10(xx))
 
 def decimate(x,dec=2):
-    """ 
+    """
     low pass filter and decimate
     """
     Nout = int(math.floor(len(x)/dec))
