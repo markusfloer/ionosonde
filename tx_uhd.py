@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 #
-# Copyright 2020, Juha Vierinen, Markus Floer
-#
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 """
@@ -15,127 +13,176 @@ import threading
 import numpy as n
 import matplotlib.pyplot as plt
 import os
+import signal
 
 # internal modules related with the ionosonde
 import sweep
 import gps_lock as gl
-import iono_logger as l
+import iono_logger
 import iono_config
+from datetime import datetime, timedelta
 
-def tune_at(u,t0,f0=4e6,gpio_state=0):
-    """ 
-    tune radio to frequency f0 at t0_full 
+
+Exit = False        # Used to signal an orderly exit
+
+
+def orderlyExit(signalNumber, frame):
+    global Exit
+    # Signal that we want to exit after current sweep
+    print("Recieved SIGUSR1", flush=True)
+    Exit = True
+
+
+def tune_at(u, t0, ic, f0=4e6, gpio_state=0):
+    """
+    tune radio to frequency f0 at t0_full
     use a timed command.
+
+    Toggle watchdog pin 1/16 on TX DB
+    Control antenna selector pin 2/16 on TX DB based on configuration
     """
     u.clear_command_time()
     t0_ts=uhd.libpyuhd.types.time_spec(t0)
-    print("tuning to %1.2f MHz at %1.2f"%(f0/1e6,t0_ts.get_real_secs()))
+    print("tuning to %1.2f MHz at %1.2f" % (f0/1e6, t0_ts.get_real_secs()))
     u.set_command_time(t0_ts)
     tune_req=uhd.libpyuhd.types.tune_request(f0)
     u.set_tx_freq(tune_req)
     u.set_rx_freq(tune_req)
-    
-    if gpio_state == 0:
-        out=0x00
-    else:
-        out=0x01
-    gpio_line=0x01 # pin 0
-    print("TX A GPIO pin 0=%d"%(out))
-    u.set_gpio_attr("TXA","OUT",out,gpio_line,0)
+
+    # toggle pin 1/16 for watchdog
+    watchdog = 0x00 if gpio_state == 0 else 0x01
+
+    # toggle pin 2/16 for antenna select
+    antenna_select = 0x02 if f0/1e6 > ic.antenna_select_freq else 0x00
+
+    print("Watchdog TX A GPIO={:02b}".format(watchdog | antenna_select))
+
+    gpio_line=0xff
+    u.set_gpio_attr("TXA", "OUT", watchdog | antenna_select, gpio_line, 0)
+
     u.clear_command_time()
 
-def tx_send(tx_stream,waveform,md,timeout=11.0):
+
+def tx_send(tx_stream, waveform, md, ic, timeout=11.0):
     # this command will block until everything is in the transmit
     # buffer.
-    tx_stream.send(waveform,md,timeout=(len(waveform)/float(iono_config.sample_rate))+1.0)
+    tx_stream.send(waveform, md, timeout=(len(waveform)/float(ic.sample_rate))+1.0)
 
-def rx_swr(u,t0,recv_buffer,f0,log):
+
+def rx_swr(u, t0, recv_buffer, f0, log, ic):
     """
     Receive samples for a reflected power measurement
-    USRP output connected to input with 35 dB attenuation gives 
+    USRP output connected to input with 35 dB attenuation gives
     9.96 dB reflected power.
     """
     N=len(recv_buffer)
-    stream_args=uhd.usrp.StreamArgs("fc32","sc16")    
+    stream_args=uhd.usrp.StreamArgs("fc32", "sc16")
     rx_stream=u.get_rx_stream(stream_args)
     stream_cmd = uhd.types.StreamCMD(uhd.types.StreamMode.num_done)
     stream_cmd.num_samps=N
     stream_cmd.stream_now=False
     stream_cmd.time_spec=uhd.types.TimeSpec(t0)
-    rx_stream.issue_stream_cmd(stream_cmd)    
+    rx_stream.issue_stream_cmd(stream_cmd)
     md=uhd.types.RXMetadata()
-    num_rx_samps=rx_stream.recv(recv_buffer,md,timeout=float(N/iono_config.sample_rate)+1.0)
+    num_rx_samps=rx_stream.recv(recv_buffer, md, timeout=float(N/ic.sample_rate)+1.0)
     pwr=n.mean(n.abs(recv_buffer)**2.0)
     rx_stream=None
-    refl_pwr_dBm=10.0*n.log10(pwr)+iono_config.reflected_power_cal_dB
-    log.log("reflected pwr %1.4f (MHz) %1.4f (dBm)"%(f0,refl_pwr_dBm))
+    if pwr <= 0.0:
+        pwr=1e-99
+    refl_pwr_dBm=10.0*n.log10(pwr)+ic.reflected_power_cal_dB
+    log.log("reflected pwr %1.4f (MHz) %1.4f (dBm)" % (f0/1e6, refl_pwr_dBm))
 
-def transmit_waveform(u,t0_full,waveform,swr_buffer,f0,log):
+
+def transmit_waveform(u, t0_full, waveform, swr_buffer, f0, log, ic):
     """
-    Transmit a timed burst 
+    Transmit a timed burst
     """
-    t0_ts=uhd.libpyuhd.types.time_spec(n.uint64(t0_full),0.0)
-    stream_args=uhd.usrp.StreamArgs("fc32","sc16")
+    t0_ts=uhd.libpyuhd.types.time_spec(n.uint64(t0_full), 0.0)
+    stream_args=uhd.usrp.StreamArgs("fc32", "sc16")
     md=uhd.types.TXMetadata()
     md.has_time_spec=True
     md.time_spec=t0_ts
-    
-    print("transmit start at %1.2f"%(t0_full))
-    
+
+    t0_full_dt = datetime.fromtimestamp(t0_full)
+    print("transmit start at %1.2f (%s)" % (t0_full, t0_full_dt.strftime("%FT%T.%f")[:-3]))
+
     # wait for moment right before transmit
     t_now=u.get_time_now().get_real_secs()
-    print("setup time %1.2f"%(t_now))
+    t_now_dt = datetime.fromtimestamp(t_now)
+    print("setup time %1.2f (%s)" % (t_now, t_now_dt.strftime("%FT%T.%f")[:-3]))
     if t_now > t0_full:
-        log.log("Delayed start for transmit %1.2f %1.2f"%(t_now,t0_full))
+        log.log(
+            "Delayed start for transmit %1.2f (%s)  %1.2f (%s)"
+            % (
+                t_now,
+                t_now_dt.strftime("%FT%T.%f")[:-3],
+                t0_full,
+                t0_full_dt.strftime("%FT%T.%f")[:-3]
+            )
+        )
     if t0_full-t_now > 0.1:
         time.sleep(t0_full-t_now-0.1)
 
     try:
         # transmit the code
         tx_stream=u.get_tx_stream(stream_args)
-        tx_thread = threading.Thread(target=tx_send,args=(tx_stream,waveform,md))
-        tx_thread.daemon=True # exit if parent thread exits
+        tx_thread = threading.Thread(target=tx_send, args=(tx_stream, waveform, md, ic))
+        tx_thread.daemon=True  # exit if parent thread exits
         tx_thread.start()
 
         # do an swr measurement
-        rx_thread = threading.Thread(target=rx_swr,args=(u,t0_full,swr_buffer,f0,log))
-        rx_thread.daemon=True # exit if parent thread exits
+        rx_thread = threading.Thread(target=rx_swr, args=(u, t0_full, swr_buffer, f0, log, ic))
+        rx_thread.daemon=True  # exit if parent thread exits
         rx_thread.start()
         tx_thread.join()
         rx_thread.join()
         tx_stream=None
-    except:
+    except Exception as e:
         exit(0)
-    
-def main():
+
+
+def main(config):
     """
     The main loop for the ionosonde transmitter
     """
-    t_start=time.time()
-    logfname="tx-%d.log"%(t_start)
-    log=l.logger(logfname)
-    os.system("ln -sf %s tx-current.log"%(logfname))
-    log.log("Starting TX sweep",print_msg=True)
+    global Exit
+
+    # setup a logger
+    log = iono_logger.logger("tx-")
 
     # this is the sweep configuration
-    s=iono_config.s
-    
-    sample_rate=iono_config.sample_rate
-    
+    s = ic.s
+
+    # register signals to be caught
+    signal.signal(signal.SIGUSR1, orderlyExit)
+
+    sample_rate=ic.sample_rate
+
     # use the address configured for the transmitter
-    usrp = uhd.usrp.MultiUSRP("addr=%s"%(iono_config.tx_addr))
+    usrp = uhd.usrp.MultiUSRP("addr=%s" % (ic.tx_addr))
     usrp.set_tx_rate(sample_rate)
     usrp.set_rx_rate(sample_rate)
-    
-    rx_subdev_spec=uhd.usrp.SubdevSpec(iono_config.rx_subdev)
-    tx_subdev_spec=uhd.usrp.SubdevSpec(iono_config.tx_subdev)
-    
+
+    rx_subdev_spec=uhd.usrp.SubdevSpec(ic.tx_subdev_refl_pwr)
+    tx_subdev_spec=uhd.usrp.SubdevSpec(ic.tx_subdev)
+
     usrp.set_tx_subdev_spec(tx_subdev_spec)
     usrp.set_rx_subdev_spec(rx_subdev_spec)
 
-    # wait until GPS is locked, then align USRP time with global ref
-    gl.sync_clock(usrp,log,min_sync_time=iono_config.min_gps_lock_time)
     
+    # wait until GPS is locked, then align USRP time with global ref
+    gps_mon=None
+    if ic.require_gps == False:
+        usrp.set_clock_source("external");
+        usrp.set_time_source("external");
+        time_at_last_pps = usrp.get_time_last_pps().get_real_secs()
+        while time_at_last_pps == usrp.get_time_last_pps().get_real_secs():
+            time.sleep(0.1)
+        usrp.set_time_next_pps(uhd.libpyuhd.types.time_spec(int(n.ceil(time.time()))));
+    else:
+        gl.sync_clock(usrp, log, min_sync_time=ic.min_gps_lock_time)
+        gps_mon=gl.gpsdo_monitor(usrp, log, ic.gps_holdover_time)
+
     # start with first frequency on tx and rx
     tune_req=uhd.libpyuhd.types.tune_request(s.freq(0))
     usrp.set_tx_freq(tune_req)
@@ -143,32 +190,52 @@ def main():
 
     # hold SWR measurement about half of the transmit waveform length, so
     # we have no timing issues
-    swr_buffer=n.empty(int(0.5*sample_rate*s.freq_dur),dtype=n.complex64)
-     
+    swr_buffer=n.empty(int(0.5*sample_rate*s.freq_dur), dtype=n.complex64)
+
     # figure out when to start the cycle
-    t_now=usrp.get_time_now().get_real_secs()    
+    t_now=usrp.get_time_now().get_real_secs()
     t0=n.uint64(n.floor(t_now/(s.sweep_len_s))*s.sweep_len_s+s.sweep_len_s)
-    print("starting next sweep at %1.2f"%(s.sweep_len_s))
+    print("starting next sweep at %1.2f" % (s.sweep_len_s))
 
     gpio_state=0
-    while True:
-        log.log("Starting sweep at %1.2f"%(t0))
+    while not Exit:
+        t0_dt = datetime.fromtimestamp(t0)
+        log.log("Starting sweep at %1.2f (%s)" % (t0, t0_dt.strftime("%FT%T.%f")[:-3]))
         for i in range(s.n_freqs):
-            f0,dt=s.pars(i)
-            
-            print("f=%f bandwidth %d kHz"%(f0,s.bw(i)*1e3))
-            transmit_waveform(usrp,n.uint64(t0+dt),s.waveform(i),swr_buffer,f0,log)                
-            
+            f0, dt=s.pars(i)
+
+            print("f=%f code %s" % (f0/1e6, s.code(i)))
+            transmit_waveform(usrp, n.uint64(t0+dt), s.waveform(i), swr_buffer, f0, log, ic)
+
             # tune to next frequency 0.0 s before end
-            next_freq_idx=(i+1)%s.n_freqs
-            tune_at(usrp,t0+dt+s.freq_dur-0.05,f0=s.freq(next_freq_idx),gpio_state=gpio_state)
-            gpio_state=(gpio_state+1)%2
+            next_freq_idx=(i+1) % s.n_freqs
+            tune_at(usrp, t0+dt+s.freq_dur-0.05, ic, f0=s.freq(next_freq_idx), gpio_state=gpio_state)
+            gpio_state=(gpio_state+1) % 2
 
             # check that GPS is still locked.
-            gl.check_lock(usrp,log,exit_if_not_locked=True)
+            if ic.require_gps:
+                gps_mon.check()
 
         t0+=n.uint64(s.sweep_len_s)
 
-    
+
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '-c', '--config',
+        default="config/default.ini",
+        help='''Configuration file. (default: %(default)s)''',
+    )
+    parser.add_argument(
+        '-v', '--verbose',
+        action="store_true",
+        help='''Increase output verbosity. (default: %(default)s)''',
+    )
+    op = parser.parse_args()
+
+    ic = iono_config.get_config(
+        config=op.config,
+        write_waveforms=True,
+        quiet=not op.verbose
+    )
+    main(ic)

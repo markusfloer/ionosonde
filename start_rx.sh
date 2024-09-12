@@ -1,11 +1,12 @@
-#!/usr/bin/bash
+#!/bin/bash
 
-export PYTHONPATH="/usr/local/lib/python3/dist-packages/"
-sudo sysctl -w net.core.rmem_max=500000000
-sudo sysctl -w net.core.wmem_max=2500000
+source config.sh
+
+WAIT=10
 while true;
 do
-    python3 rx_uhd.py
-    sleep 10
+    python3 rx_uhd.py --config=$IONO_CONFIG
+    echo "Waiting $WAIT seconds"
+    sleep $WAIT
 done
-    
+
